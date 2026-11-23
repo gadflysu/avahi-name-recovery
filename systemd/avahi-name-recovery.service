@@ -1,0 +1,11 @@
+[Unit]
+Description=Recover the Avahi hostname after a conflict
+
+[Service]
+Type=oneshot
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+RuntimeDirectory=avahi-name-recovery
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+TimeoutStartSec=4min
+ExecStart=/usr/local/sbin/avahi-name-recovery

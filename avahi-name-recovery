@@ -1,0 +1,154 @@
+#!/usr/bin/bash
+set -euo pipefail
+export LC_ALL=C
+
+avahi_unit=avahi-daemon.service
+
+avahi_call() {
+    busctl --system --auto-start=no --timeout=1s call \
+        org.freedesktop.Avahi / org.freedesktop.Avahi.Server "$1"
+}
+
+avahi_dns_name() {
+    local response name
+    local pattern='^s "([a-zA-Z0-9.-]+)"$'
+
+    response=$(avahi_call "$1") || return 1
+    [[ $response =~ $pattern ]] || return 1
+    name=${BASH_REMATCH[1]}
+    name=${name%.}
+    [[ -n $name ]] || return 1
+    printf '%s\n' "${name,,}"
+}
+
+get_published_name() {
+    local state
+
+    state=$(avahi_call GetState) || return 1
+    [[ $state == 'i 2' ]] || return 1
+    avahi_dns_name GetHostNameFqdn
+}
+
+uses_default_hostname() {
+    awk '
+        /^[[:space:]]*\[/ {
+            server = tolower($0) ~ /^[[:space:]]*\[[[:space:]]*server[[:space:]]*\]/
+            next
+        }
+        server {
+            line = tolower($0)
+            if (line ~ /^[[:space:]]*host-name[[:space:]]*=/ ||
+                line ~ /^[[:space:]]*host-name-from-machine-id[[:space:]]*=[[:space:]]*y/)
+                custom = 1
+        }
+        END { exit custom ? 1 : 0 }
+    ' "$1"
+}
+
+get_expected_hostname() {
+    local name label_pattern='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
+
+    if [[ ${AVAHI_EXPECTED_HOSTNAME+x} ]]; then
+        name=$AVAHI_EXPECTED_HOSTNAME
+    else
+        uses_default_hostname "$1" || return 1
+        name=$(hostname) || return 1
+        name=${name%%.*}
+    fi
+
+    name=${name,,}
+    [[ $name =~ $label_pattern ]] || return 1
+    printf '%s\n' "$name"
+}
+
+is_conflict_name() {
+    local expected_hostname=$1 domain=$2 published_name=$3
+    local suffix_pattern='^(.+)-([1-9][0-9]*)$'
+    local stem=$expected_hostname previous_number=1
+    local candidate_stem number prefix_length
+
+    [[ $published_name == *."$domain" ]] || return 1
+    [[ ${published_name%."$domain"} =~ $suffix_pattern ]] || return 1
+    candidate_stem=${BASH_REMATCH[1]}
+    number=${BASH_REMATCH[2]}
+
+    if [[ $expected_hostname =~ $suffix_pattern ]]; then
+        stem=${BASH_REMATCH[1]}
+        previous_number=${BASH_REMATCH[2]}
+    fi
+
+    # Avahi 0.8 stores the suffix in a signed int and limits labels to 63 bytes.
+    (( ${#number} <= 10 && ${#previous_number} <= 10 )) || return 1
+    (( number <= 2147483647 && number > previous_number )) || return 1
+    prefix_length=$(( 62 - ${#number} ))
+    [[ $candidate_stem == "${stem:0:prefix_length}" ]]
+}
+
+main() {
+    local attempt_file="${RUNTIME_DIRECTORY:?}/last-attempt"
+    local published_name expected_hostname domain expected_name
+    local uptime now last_attempt deadline
+
+    systemctl is-active --quiet "$avahi_unit" || return 0
+
+    if ! published_name=$(get_published_name) || ! domain=$(avahi_dns_name GetDomainName); then
+        printf 'Avahi publication or domain is unavailable. Skipping this check.\n' >&2
+        return 0
+    fi
+
+    if ! expected_hostname=$(get_expected_hostname "$1"); then
+        printf 'Expected hostname is unavailable. Set AVAHI_EXPECTED_HOSTNAME for custom Avahi naming.\n' >&2
+        return 0
+    fi
+    expected_name=$expected_hostname.$domain
+
+    if [[ $published_name == "$expected_name" ]]; then
+        rm -f -- "$attempt_file"
+        return 0
+    fi
+
+    if ! is_conflict_name "$expected_hostname" "$domain" "$published_name"; then
+        printf 'Avahi published an unexpected name (%s). Skipping this check.\n' "$published_name" >&2
+        return 0
+    fi
+
+    read -r uptime _ < /proc/uptime
+    now=${uptime%%.*}
+    if [[ -f $attempt_file ]] &&
+        read -r last_attempt < "$attempt_file" &&
+        [[ $last_attempt =~ ^(0|[1-9][0-9]{0,11})$ ]] &&
+        (( now >= last_attempt && now - last_attempt < 3600 )); then
+        return 0
+    fi
+
+    printf '%s\n' "$now" > "$attempt_file.new"
+    mv -f -- "$attempt_file.new" "$attempt_file"
+    printf 'Avahi is publishing %s. Restarting to retry %s.\n' "$published_name" "$expected_name"
+
+    if ! systemctl try-restart "$avahi_unit"; then
+        printf 'Avahi restart failed. The retry interval is one hour.\n' >&2
+        return 1
+    fi
+
+    deadline=$(( SECONDS + 20 ))
+    while (( SECONDS + 2 < deadline )); do
+        if published_name=$(get_published_name); then
+            if [[ $published_name == "$expected_name" ]]; then
+                rm -f -- "$attempt_file"
+                printf 'Avahi recovered %s.\n' "$expected_name"
+                return 0
+            fi
+
+            printf 'Avahi is now publishing %s. The retry interval is one hour.\n' "$published_name" >&2
+            return 0
+        fi
+        sleep 1
+    done
+
+    printf 'Avahi publication could not be verified after restart. The retry interval is one hour.\n' >&2
+    return 1
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main /etc/avahi/avahi-daemon.conf
+fi

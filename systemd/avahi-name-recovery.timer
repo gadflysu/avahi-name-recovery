@@ -1,0 +1,10 @@
+[Unit]
+Description=Check the Avahi hostname periodically
+
+[Timer]
+OnActiveSec=15min
+OnUnitInactiveSec=15min
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
