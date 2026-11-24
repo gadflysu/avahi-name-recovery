@@ -33,6 +33,10 @@ case "${!#}" in
             printf 'i 2\n'
         fi
         ;;
+    ExecStart)
+        [[ $TEST_STATE != failed-execstart ]] || exit 1
+        printf '%s\n' "$TEST_EXEC_START"
+        ;;
     GetDomainName)
         [[ $TEST_STATE != failed-domain ]] || exit 1
         printf 's "%s"\n' "$TEST_DOMAIN"
@@ -53,9 +57,11 @@ run_case() {
     local expected_restarts=$6 expected_attempt=$7 expected_status=$8
     shift 8
     local config=${TEST_CONFIG:-$'[server]\n#host-name=example'}
+    local default_exec='a(sasbttttuii) 1 "/usr/sbin/avahi-daemon" 2 "/usr/sbin/avahi-daemon" "-s" false 0 0 0 0 0 0 0'
     local status=0 output restart_calls='' has_attempt=no
 
-    rm -f -- "$work_dir/restarts" "$work_dir/last-attempt"
+    rm -f -- "$work_dir/restarts"
+    if [[ ${KEEP_ATTEMPT:-no} != yes ]]; then rm -f -- "$work_dir/last-attempt"; fi
     printf '%s\n' "$config" > "$work_dir/avahi.conf"
     if [[ ${1:-} ]]; then printf '%s\n' "$1" > "$work_dir/last-attempt"; fi
 
@@ -65,15 +71,10 @@ run_case() {
         "TEST_HOSTNAME=$hostname" "TEST_DOMAIN=$domain" \
         "TEST_PUBLISHED=$published" "TEST_AFTER=$after" \
         "TEST_STATE=${TEST_STATE:-running}" "TEST_RESTART=${TEST_RESTART:-success}" \
+        "TEST_EXEC_START=${TEST_EXEC_START-$default_exec}" "TEST_NOW=${TEST_NOW:-10800}" \
         bash -c '
             source "$1"
-            read() {
-                if [[ $* == "-r uptime _" ]]; then
-                    printf -v "$2" "%s" 10800.00
-                    return 0
-                fi
-                builtin read "$@"
-            }
+            monotonic_seconds() { printf "%s\n" "$TEST_NOW"; }
             main "$2"
         ' bash "$project_dir/avahi-name-recovery" "$work_dir/avahi.conf" 2>&1) || status=$?
 
@@ -123,3 +124,42 @@ run_case 'persistent conflict stores cooldown' desk local desk-2.local desk-2.lo
 run_case 'recent attempt defers restart' desk local desk-2.local desk.local '' yes 0 10799
 run_case 'expired cooldown permits one restart' desk local desk-2.local desk.local "$restart" no 0 7200
 TEST_RESTART=fail run_case 'restart failure preserves cooldown' desk local desk-2.local desk.local "$restart" yes 1
+
+exec_header='a(sasbttttuii) 1'
+exec_binary='"/usr/sbin/avahi-daemon"'
+exec_status='false 0 0 0 0 0 0 0'
+TEST_EXEC_START="$exec_header $exec_binary 1 $exec_binary $exec_status" \
+    run_case 'direct Avahi command without options uses default configuration' \
+        desk local desk-2.local desk.local "$restart" no 0
+TEST_EXEC_START="$exec_header $exec_binary 4 $exec_binary \"-s\" \"-f\" \"/etc/avahi/custom.conf\" $exec_status" \
+    run_case 'alternate config with short option skips recovery' \
+        desk local desk-2.local desk.local '' no 0
+TEST_EXEC_START="$exec_header $exec_binary 2 $exec_binary \"-f/etc/avahi/custom.conf\" $exec_status" \
+    run_case 'alternate config with attached short option skips recovery' \
+        desk local desk-2.local desk.local '' no 0
+TEST_EXEC_START="$exec_header $exec_binary 2 $exec_binary \"--file=/etc/avahi/custom.conf\" $exec_status" \
+    run_case 'alternate config with long option skips recovery' \
+        desk local desk-2.local desk.local '' no 0
+TEST_EXEC_START="$exec_header $exec_binary 3 $exec_binary \"--file\" \"/etc/avahi/custom.conf\" $exec_status" \
+    run_case 'alternate config with separate long option skips recovery' \
+        desk local desk-2.local desk.local '' no 0
+TEST_EXEC_START="$exec_header \"/usr/bin/sh\" 3 \"/usr/bin/sh\" \"-c\" \"avahi-daemon -s\" $exec_status" \
+    run_case 'wrapper command skips recovery' desk local desk-2.local desk.local '' no 0
+TEST_EXEC_START="$exec_header $exec_binary 2 $exec_binary \"\$AVAHI_OPTS\" $exec_status" \
+    run_case 'variable startup arguments skip recovery' desk local desk-2.local desk.local '' no 0
+TEST_EXEC_START='' run_case 'malformed startup query skips recovery' desk local desk-2.local desk.local '' no 0
+TEST_STATE=failed-execstart run_case 'failed startup query skips recovery' desk local desk-2.local desk.local '' no 0
+AVAHI_EXPECTED_HOSTNAME=desk TEST_STATE=failed-execstart \
+    run_case 'explicit hostname supports custom or unavailable startup details' \
+        kernel-name local desk-2.local desk.local "$restart" no 0
+
+TEST_NOW=10000 run_case 'unresolved first attempt starts cooldown' \
+    desk local desk-2.local desk-2.local "$restart" yes 0
+TEST_NOW=13599 KEEP_ATTEMPT=yes run_case 'failed attempt still cools down at 3599 seconds' \
+    desk local desk-2.local desk.local '' yes 0
+TEST_NOW=13600 KEEP_ATTEMPT=yes run_case 'failed attempt may retry at 3600 seconds' \
+    desk local desk-2.local desk.local "$restart" no 0
+TEST_NOW=10000 run_case 'successful restart clears cooldown' \
+    desk local desk-2.local desk.local "$restart" no 0
+TEST_NOW=10900 KEEP_ATTEMPT=yes run_case 'next check may retry after confirmed success' \
+    desk local desk-2.local desk.local "$restart" no 0

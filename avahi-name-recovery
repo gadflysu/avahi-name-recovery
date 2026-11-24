@@ -29,6 +29,36 @@ get_published_name() {
     avahi_dns_name GetHostNameFqdn
 }
 
+uses_default_avahi_command() {
+    local response argc index
+    local -a fields
+
+    response=$(busctl --system --timeout=1s get-property org.freedesktop.systemd1 \
+        /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice \
+        org.freedesktop.systemd1.Service ExecStart) || return 1
+    read -r -a fields <<< "$response"
+    argc=${fields[3]-}
+    [[ ${fields[0]-} == 'a(sasbttttuii)' && ${fields[1]-} == 1 &&
+        $argc =~ ^[1-9][0-9]{0,2}$ ]] || return 1
+    # Four header fields, argv, then the ignore-failure flag and seven status fields.
+    (( ${#fields[@]} == argc + 12 )) || return 1
+
+    case ${fields[2]} in
+        '"/usr/sbin/avahi-daemon"'|'"/usr/bin/avahi-daemon"'|\
+        '"/sbin/avahi-daemon"'|'"/bin/avahi-daemon"') ;;
+        *) return 1 ;;
+    esac
+    [[ ${fields[4]} == "${fields[2]}" && ${fields[argc+4]} =~ ^(true|false)$ ]] || return 1
+
+    for (( index = 5; index < argc + 4; index++ )); do
+        case ${fields[index]} in
+            '"-s"'|'"--syslog"'|'"-D"'|'"--daemonize"'|'"--debug"'|\
+            '"--no-drop-root"'|'"--no-rlimits"'|'"--no-chroot"'|'"--no-proc-title"') ;;
+            *) return 1 ;;
+        esac
+    done
+}
+
 uses_default_hostname() {
     awk '
         /^[[:space:]]*\[/ {
@@ -51,7 +81,7 @@ get_expected_hostname() {
     if [[ ${AVAHI_EXPECTED_HOSTNAME+x} ]]; then
         name=$AVAHI_EXPECTED_HOSTNAME
     else
-        uses_default_hostname "$1" || return 1
+        uses_default_avahi_command && uses_default_hostname "$1" || return 1
         name=$(hostname) || return 1
         name=${name%%.*}
     fi
@@ -84,10 +114,17 @@ is_conflict_name() {
     [[ $candidate_stem == "${stem:0:prefix_length}" ]]
 }
 
+monotonic_seconds() {
+    local uptime
+
+    read -r uptime _ < /proc/uptime || return 1
+    printf '%s\n' "${uptime%%.*}"
+}
+
 main() {
     local attempt_file="${RUNTIME_DIRECTORY:?}/last-attempt"
     local published_name expected_hostname domain expected_name
-    local uptime now last_attempt deadline
+    local now last_attempt deadline
 
     systemctl is-active --quiet "$avahi_unit" || return 0
 
@@ -97,7 +134,7 @@ main() {
     fi
 
     if ! expected_hostname=$(get_expected_hostname "$1"); then
-        printf 'Expected hostname is unavailable. Set AVAHI_EXPECTED_HOSTNAME for custom Avahi naming.\n' >&2
+        printf 'Cannot determine the expected Avahi hostname. Set AVAHI_EXPECTED_HOSTNAME for custom startup or naming.\n' >&2
         return 0
     fi
     expected_name=$expected_hostname.$domain
@@ -112,8 +149,7 @@ main() {
         return 0
     fi
 
-    read -r uptime _ < /proc/uptime
-    now=${uptime%%.*}
+    now=$(monotonic_seconds)
     if [[ -f $attempt_file ]] &&
         read -r last_attempt < "$attempt_file" &&
         [[ $last_attempt =~ ^(0|[1-9][0-9]{0,11})$ ]] &&

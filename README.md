@@ -6,7 +6,7 @@ A systemd timer checks the published name every 15 minutes. When it detects a nu
 
 ## Requirements
 
-- Linux with systemd, Bash 4 or later, standard system utilities, and Avahi with D-Bus enabled.
+- Linux with systemd 243 or later, Bash 4 or later, standard system utilities, and Avahi with D-Bus enabled.
 - A running system service named `avahi-daemon.service`. The recovery unit queries its system bus and asks systemd to restart the existing service.
 
 ## Install
@@ -31,7 +31,7 @@ journalctl -u avahi-name-recovery.service
 
 The default expected hostname is the kernel hostname's first label, combined with Avahi's current domain from D-Bus. For example, `workbench.example.org` on Avahi's `local` domain becomes `workbench.local`. Comparisons are case-insensitive.
 
-When Avahi uses a configured hostname, machine-ID naming, or an alternate configuration file, supply its expected starting label as a service override. This label is only used for comparison. Avahi chooses its hostname during its regular startup.
+Automatic hostname detection requires a direct, standard Avahi systemd command and the default Avahi configuration path. Set the expected starting label in a service override if Avahi uses a configured hostname, machine-ID naming, a different configuration file, or a custom startup command. When the default startup cannot be verified, recovery waits for this override. The label is only used for comparison. Avahi chooses its hostname during its regular startup.
 
 ```sh
 sudo systemctl edit avahi-name-recovery.service
